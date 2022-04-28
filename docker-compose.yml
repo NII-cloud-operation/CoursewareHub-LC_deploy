@@ -1,0 +1,10 @@
+version: '3.5'
+services:
+  jupyter:
+    build:
+        context: ./image
+    ports:
+        - 8888:8888
+    volumes:
+        - './:/home/jovyan'
+

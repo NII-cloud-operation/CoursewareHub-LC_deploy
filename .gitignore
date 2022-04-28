@@ -1,0 +1,4 @@
+.*
+!/.gitignore
+nbsearch-tmp
+hosts
