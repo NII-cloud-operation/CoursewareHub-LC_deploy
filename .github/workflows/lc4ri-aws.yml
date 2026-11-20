@@ -1,0 +1,110 @@
+name: AWS | Prepare CoursewareHub hosts via OperationHub
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: &e2e_paths ['tests/lc4ri/**', '.github/workflows/lc4ri-aws.yml', '*.ipynb', 'image/**', 'coursewarehub/**']
+  push:
+    branches: ['**']
+    paths: *e2e_paths
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  aws:
+    name: AWS | Build OperationHub and verify the CoursewareHub inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify unchanged Notebook originals
+        run: git diff --exit-code HEAD -- '*.ipynb'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tests/lc4ri/requirements-aws.txt
+      - name: Install browser and VM tools
+        run: |
+          python -m pip install -r tests/lc4ri/requirements-aws.txt
+          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ffmpeg fonts-noto-cjk
+          install -Dm644 tests/lc4ri/fonts.conf ~/.config/fontconfig/fonts.conf
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - name: Read guest image identity
+        id: image
+        run: |
+          source tests/lc4ri/guests/guest-image.env
+          echo "sha=$CWH_E2E_GUEST_IMAGE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "CWH_E2E_IMAGE_CACHE=$RUNNER_TEMP/coursewarehub-cloud-image" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@v4
+        id: guest-image
+        with:
+          path: ${{ runner.temp }}/coursewarehub-cloud-image
+          key: rocky-cloud-image-${{ steps.image.outputs.sha }}
+      - name: Verify guest image
+        run: bash tests/lc4ri/guests/prepare-guest-image.sh "$CWH_E2E_IMAGE_CACHE"
+      - uses: actions/cache/save@v4
+        if: steps.guest-image.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/coursewarehub-cloud-image
+          key: rocky-cloud-image-${{ steps.image.outputs.sha }}
+      - name: Build OperationHub and prepare the inventory through the LC4RI UI
+        run: bash tests/lc4ri/run-operationhub.sh
+      - name: Verify execution preserved Notebook originals
+        if: always()
+        run: git diff --exit-code HEAD -- '*.ipynb'
+      - name: Render chapters and the complete walkthrough
+        if: success() || (!cancelled() && hashFiles('test-results/lc4ri-operationhub/**/segments.json') != '')
+        run: python tests/lc4ri/render_movie.py test-results/lc4ri-operationhub
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operationhub-walkthrough
+          path: |
+            test-results/lc4ri-operationhub/movies/walkthrough.mp4
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operationhub-chapters
+          path: |
+            test-results/lc4ri-operationhub/movies/*.mp4
+            !test-results/lc4ri-operationhub/movies/walkthrough.mp4
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operationhub-recordings
+          path: |
+            test-results/lc4ri-operationhub/**/*.webm
+            test-results/lc4ri-operationhub/**/segments.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operationhub-trace
+          path: |
+            test-results/lc4ri-operationhub/**/*trace.zip
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operationhub-results
+          path: |
+            test-results/lc4ri-operationhub/**
+            !test-results/lc4ri-operationhub/movies/**
+            !test-results/lc4ri-operationhub/**/*.webm
+            !test-results/lc4ri-operationhub/**/*trace.zip
+            !test-results/lc4ri-operationhub/**/segments.json
+          if-no-files-found: error
+          retention-days: 14
