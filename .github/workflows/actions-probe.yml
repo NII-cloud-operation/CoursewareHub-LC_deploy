@@ -1,0 +1,13 @@
+name: Actions trigger probe
+on:
+  push:
+    branches: [diagnostics/actions-probe]
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/actions-probe.yml']
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Received ${{ github.event_name }}"
