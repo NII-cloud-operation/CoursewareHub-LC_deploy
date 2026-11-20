@@ -1,0 +1,4 @@
+playwright==1.55.0
+PyYAML==6.0.3
+signxml==5.2.0
+lxml==6.0.2
