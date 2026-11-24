@@ -1,0 +1,20 @@
+<?php
+unset($CFG);
+global $CFG;
+$CFG = new stdClass();
+$CFG->dbtype = 'pgsql';
+$CFG->dblibrary = 'native';
+$CFG->dbhost = 'cwh-moodle-db';
+$CFG->dbname = 'moodle';
+$CFG->dbuser = 'moodle';
+$CFG->dbpass = getenv('CWH_MOODLE_PASSWORD');
+$CFG->prefix = 'mdl_';
+$CFG->wwwroot = getenv('CWH_MOODLE_URL');
+$CFG->dataroot = '/var/www/moodledata';
+$CFG->admin = 'admin';
+$CFG->directorypermissions = 02770;
+$CFG->passwordpolicy = 0;
+$CFG->debug = E_ALL;
+$CFG->debugdisplay = 0;
+$CFG->pathtophp = '/usr/local/bin/php';
+require_once(__DIR__ . '/lib/setup.php');

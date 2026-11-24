@@ -1,0 +1,5 @@
+-r requirements.txt
+moto[server]==5.2.4
+awscli==1.46.2
+passlib==1.7.4
+cfn-lint==1.58.0
