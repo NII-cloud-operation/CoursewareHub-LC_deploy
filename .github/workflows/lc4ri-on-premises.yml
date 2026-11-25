@@ -1,6 +1,13 @@
 name: On-premises | Build and use CoursewareHub
 on:
   workflow_dispatch:
+    inputs:
+      jupyterhub_deploy:
+        description: Optional D03/D05 roles (owner/repository@branch, @refs/pull/N/head or @commit)
+        type: string
+      manage_tools:
+        description: Optional D06 tools (owner/repository@branch, @refs/pull/N/head or @commit)
+        type: string
   pull_request:
     branches: [main]
     paths: &e2e_paths ['tests/lc4ri/**', '.github/workflows/lc4ri-on-premises.yml', 'coursewarehub/**']
@@ -24,6 +31,8 @@ jobs:
           - authentication: federation
             scenario: SAML federation
     env:
+      LC4RI_JUPYTERHUB_DEPLOY: ${{ inputs.jupyterhub_deploy }}
+      LC4RI_MANAGE_TOOLS: ${{ inputs.manage_tools }}
       LC4RI_AUTHENTICATION: ${{ matrix.authentication }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120

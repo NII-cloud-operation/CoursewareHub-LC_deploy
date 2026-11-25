@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import time
 from urllib.parse import quote
@@ -17,6 +19,28 @@ from lab_controls import BASE, operations, open_working_copy
 from scenario import run_local_coursewarehub, run_federated_coursewarehub, run_operationhub
 
 from playwright.sync_api import sync_playwright
+
+
+def resolve_revision(variable):
+    selection = os.environ.get(variable)
+    if not selection:
+        return None
+    repository, _, ref = selection.partition('@')
+    if not re.fullmatch(r'[\w.-]+/[\w.-]+', repository) or any(part in ('.', '..') for part in repository.split('/')) or not ref:
+        raise ValueError(f'{variable}: expected owner/repository@branch, @refs/pull/N/head or @commit')
+    url = f'https://github.com/{repository}.git'
+    if re.fullmatch('[0-9a-f]{40}', ref):
+        return url, ref
+    full_ref = ref if ref.startswith('refs/') else f'refs/heads/{ref}'
+    if not (full_ref.startswith('refs/heads/') or re.fullmatch(r'refs/pull/[1-9][0-9]*/(head|merge)', full_ref)):
+        raise ValueError(f'{variable}: expected a branch, pull request ref or commit')
+    subprocess.run(['git', 'check-ref-format', full_ref], check=True)
+    output = subprocess.check_output(['git', 'ls-remote', '--refs', '--exit-code', url, full_ref],
+                                     text=True, timeout=60)
+    sha, resolved_ref = output.strip().split('\t')
+    if resolved_ref != full_ref or not re.fullmatch('[0-9a-f]{40}', sha):
+        raise ValueError(f'{variable}: could not resolve {selection}')
+    return url, sha
 
 
 def main():
@@ -39,6 +63,9 @@ def main():
     args.workers = [args.worker]
     args.test_moodle = not args.operationhub and args.authentication == 'local'
     args.saml = None
+    if not args.operationhub:
+        args.jupyterhub_deploy = resolve_revision('LC4RI_JUPYTERHUB_DEPLOY')
+        args.manage_tools = resolve_revision('LC4RI_MANAGE_TOOLS')
     if not args.operationhub and args.authentication == 'federation':
         from saml_provider import running_provider
         args.saml = args.fixtures.enter_context(running_provider('http://' + os.environ['LC4RI_GATEWAY'] + ':18501', 'https://coursewarehub.test', 'ciadmin@example.test'))

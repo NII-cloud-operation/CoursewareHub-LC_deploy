@@ -1,4 +1,5 @@
 """Human operations and independent acceptance checks for construction notebooks."""
+import ast
 import json
 import os
 import re
@@ -88,10 +89,39 @@ def operate_d02(original, args, controls, page, records, results):
             assert str(observed['outputs']).count('SUCCESS') == 1 + len(args.workers), observed['outputs']
 
 
+ROLE_CLONE = ('!git clone https://github.com/NII-cloud-operation/CoursewareHub-LC_jupyterhub-deploy.git '
+              '{work_dir}/jupyterhub-deploy')
+
+
+def edit_role_clone(controls, index, text, revision):
+    if text.splitlines().count(ROLE_CLONE) != 1:
+        raise ValueError(f'Expected one complete clone command: {ROLE_CLONE}')
+    url, sha = revision
+    directory = '{work_dir}/jupyterhub-deploy'
+    commands = (f'!git clone {url} {directory} && git -C {directory} fetch origin {sha} '
+                f'&& git -C {directory} checkout --detach {sha}')
+    controls.edit(index, text.replace(ROLE_CLONE, commands), 'Select the roles revision')
+
+
+def check_git_log(observed, expected):
+    output = ''.join(''.join(o['text']) for o in observed['outputs'] if o['output_type'] == 'stream')
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', output)
+    first = re.search(r'^commit ([0-9a-f]{40})\b', plain, re.M)
+    assert first and first[1] == expected, (expected, output)
+
+
+
 def operate_d03(original, args, controls, page, records, results):
+    role_clone = controls.find(ROLE_CLONE) if args.jupyterhub_deploy else None
+    role_history = controls.find('!cd {work_dir}/jupyterhub-deploy/ && git log -n 5') if args.jupyterhub_deploy else None
     before = {host: remote(host, 'cat /proc/sys/kernel/random/boot_id') for host in (args.master, *args.workers)}
     for index, text in inventory_cells(original, controls, args.group):
-        check_output('D03', index, text, controls.run(index))
+        if index == role_clone:
+            edit_role_clone(controls, index, text, args.jupyterhub_deploy)
+        observed = controls.run(index)
+        if index == role_history:
+            check_git_log(observed, args.jupyterhub_deploy[1])
+        check_output('D03', index, text, observed)
     after = {host: remote(host, 'cat /proc/sys/kernel/random/boot_id') for host in before}
     assert before[args.worker] != after[args.worker], 'D03 did not reboot the worker OS'
     mounts = remote(args.worker, 'findmnt --json --target /exchange')
@@ -195,6 +225,8 @@ def inspect_simplesaml_log(notebook, index, controls, master, records):
 
 
 def operate_d05(original, args, controls, page, records, results):
+    role_clone = controls.find(ROLE_CLONE) if args.jupyterhub_deploy else None
+    role_history = controls.find('!cd {work_dir}/jupyterhub-deploy && git log -n 5') if args.jupyterhub_deploy else None
     find = controls.find
     cells = deployment_cells(controls)
     subnet = find('###### ipam_config = ')
@@ -208,23 +240,21 @@ def operate_d05(original, args, controls, page, records, results):
     moodle = find('lti_config = {}') if args.test_moodle else None
     default_schema = 'https://raw.githubusercontent.com/NII-cloud-operation/CoursewareHub-LC_platform/master/jupyterhub/resources-schema.json'
     schema = find(default_schema) if 'LC4RI_PLATFORM_HUB' in os.environ else None
+    if schema is not None:
+        work_directory = find('work_dir = tempfile.mkdtemp()\nwork_dir')
     metadata = set()
     if args.saml is not None:
         metadata = {find("# msg_stdout = !ansible -m debug -a 'msg={{{{ cgidp_metadata"), find('# !ls -l {cgidp_metadata}'),
                     find('src={cgidp_metadata}')}
     for index, text in inventory_cells(original, controls, args.group):
+        if index == role_clone:
+            edit_role_clone(controls, index, text, args.jupyterhub_deploy)
         inputs = deployment_inputs(index, text, controls, cells)
         if index == schema:
             url = os.environ['LC4RI_PLATFORM_SCHEMA_URL']
             if not re.fullmatch(r'https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/jupyterhub/resources-schema\.json', url):
                 raise ValueError(f'Expected a platform schema URL pinned to its build commit: {url!r}')
-            controls.edit(index, text.replace(default_schema, url) + """
-import hashlib
-from pathlib import Path
-schema_sha256 = hashlib.sha256((Path(work_dir) / 'resources-schema.json').read_bytes()).hexdigest()
-print(schema_sha256)
-assert schema_sha256 == """ + repr(os.environ['LC4RI_PLATFORM_SCHEMA_SHA256']),
-                          'Fetch the schema at the platform build commit and compare it with the Hub image')
+            controls.edit(index, text.replace(default_schema, url), 'Use the resource schema from the platform build')
         if index == subnet:
             controls.edit(index, text.removeprefix('###### '), 'Select the example overlay subnet for the CI cluster dry run')
         if index == moodle:
@@ -263,6 +293,15 @@ else:
             inspect_simplesaml_log('D05', index, controls, args.master, records)
             continue
         observed = controls.run(index, inputs=inputs)
+        if index == role_history:
+            check_git_log(observed, args.jupyterhub_deploy[1])
+        if index == schema:
+            directory_output, = (o for o in controls.state(work_directory)['outputs'] if o['output_type'] == 'execute_result')
+            directory = ast.literal_eval(''.join(directory_output['data']['text/plain']))
+            checksum = subprocess.check_output(['docker', 'exec', 'cwh-lc4ri-controller', 'sha256sum',
+                                                os.path.join(directory, 'resources-schema.json')], text=True, timeout=30)
+            assert checksum.split()[0] == os.environ['LC4RI_PLATFORM_SCHEMA_SHA256'], checksum
+            (results / 'resources-schema.sha256').write_text(checksum)
         if index == registration and args.admin_password is None:
             combined = '\n'.join(o.get('text', '') for o in observed['outputs'])
             combined = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', combined)
