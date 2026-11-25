@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from construction import (
     launch_moodle_as_teacher_and_student, operate_d01, operate_d02, operate_d03,
-    operate_d04, operate_d05, operate_o01, verify_inventory,
+    operate_d04, operate_d05, operate_o01, verify_inventory, verify_platform_images,
 )
 from runtime_ui import admin_notebook_session
 
@@ -40,11 +40,13 @@ def run_local_coursewarehub(run_notebook, args, results, browser, api):
 
     args.build_repository = args.fixtures.enter_context(running_repository(os.environ['LC4RI_GATEWAY']))
     before = results / 'before-update'
+    verify_platform_images(args.master, before)
     log_in_and_run_admin_notebooks_on_coursewarehub(args, before, browser)
     launch_moodle_as_teacher_and_student(args, before, browser)
 
     run_notebook('coursewarehub/O01_CoursewareHubの更新.ipynb', operate_o01)
     after = results / 'after-update'
+    verify_platform_images(args.master, after)
     log_in_and_run_admin_notebooks_on_coursewarehub(args, after, browser, after_update=True)
     launch_moodle_as_teacher_and_student(args, after, browser, after_update=True)
 
@@ -62,12 +64,14 @@ def run_federated_coursewarehub(run_notebook, args, results, browser, api):
 
     manager = Guest('master', args.master, 'ssh')
     before = results / 'before-update'
+    verify_platform_images(args.master, before)
     prepare_saml(args.saml, manager, before / 'saml')
     log_in_and_run_admin_notebooks_on_coursewarehub(args, before, browser)
     check_saml_login(before / 'saml', args.saml, args.teacher_username, browser)
 
     run_notebook('coursewarehub/O01_CoursewareHubの更新.ipynb', operate_o01)
     after = results / 'after-update'
+    verify_platform_images(args.master, after)
     prepare_saml(args.saml, manager, after / 'saml')
     log_in_and_run_admin_notebooks_on_coursewarehub(args, after, browser, after_update=True)
     check_saml_login(after / 'saml', args.saml, args.teacher_username, browser)

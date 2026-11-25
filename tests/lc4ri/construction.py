@@ -72,7 +72,12 @@ def operate_d02(original, args, controls, page, records, results):
         elif index == setting:
             edit(index, text.replace("'10.1.1.162'", repr(args.master)), 'Select the NFS and master hosts')
         elif index == image and args.hub_image is not None:
-            edit(index, re.sub(r"^group_vars\['jupyterhub_image'\] = .+$", "group_vars['jupyterhub_image'] = " + repr(args.hub_image), text, flags=re.M), 'Select the Hub image with the fixture CA')
+            updated = re.sub(r"^group_vars\['jupyterhub_image'\] = .+$", "group_vars['jupyterhub_image'] = " + repr(args.hub_image), text, flags=re.M)
+            if 'LC4RI_AUTH_IMAGE' in os.environ:
+                if find("group_vars['auth_proxy_image'] = ") != index:
+                    raise ValueError('D02: expected both platform image settings in the same input cell')
+                updated = re.sub(r"^group_vars\['auth_proxy_image'\] = .+$", "group_vars['auth_proxy_image'] = " + repr(os.environ['LC4RI_AUTH_IMAGE']), updated, flags=re.M)
+            edit(index, updated, 'Select the images for this deployment')
         elif index == hostname:
             edit(index, text.replace("'example.com'", "'coursewarehub.test'"), 'Set the service hostname')
         elif index in federation:
@@ -119,8 +124,12 @@ def operate_d04(original, args, controls, page, records, results):
     (results / 'deployment-dns.txt').write_text(dns)
 
 
+HUB_CONFIG_VOLUME = '    - read_only: true\n      source: /etc/jupyterhub/jupyterhub_config.d\n'
+
+
 def deployment_cells(controls):
     return dict(certificate=controls.find('use_saml_cert_as_server_cert = False'),
+                compose=controls.find(HUB_CONFIG_VOLUME),
                 removal=controls.find('docker stack rm coursewarehub'),
                 password=controls.find('db_pass = getpass()'),
                 acme=controls.find("acme_server = input('ACME Server URL')\n"
@@ -131,6 +140,16 @@ def deployment_cells(controls):
 
 
 def deployment_inputs(index, text, controls, cells):
+    if index == cells['compose']:
+        if text.count(HUB_CONFIG_VOLUME) != 1:
+            raise ValueError('Expected one JupyterHub config mount in the Compose template')
+        ca_volume = '''    - read_only: true
+      source: /home/centos/certs/hub-ca-bundle.pem
+      target: /etc/ssl/certs/ca-certificates.crt
+      type: bind
+'''
+        controls.edit(index, text.replace(HUB_CONFIG_VOLUME, ca_volume + HUB_CONFIG_VOLUME),
+                      'Mount the test CA bundle for JupyterHub registry access')
     if index == cells['certificate']:
         controls.edit(index, text.replace('use_saml_cert_as_server_cert = False', 'use_saml_cert_as_server_cert = True'), 'Use the locally provisioned test certificate')
     if index == cells['removal']:
@@ -187,12 +206,25 @@ def operate_d05(original, args, controls, page, records, results):
     log_check = find('cat /var/www/simplesamlphp/log/simplesamlphp.log')
     registration = find('teacher_info_stdout =')
     moodle = find('lti_config = {}') if args.test_moodle else None
+    default_schema = 'https://raw.githubusercontent.com/NII-cloud-operation/CoursewareHub-LC_platform/master/jupyterhub/resources-schema.json'
+    schema = find(default_schema) if 'LC4RI_PLATFORM_HUB' in os.environ else None
     metadata = set()
     if args.saml is not None:
         metadata = {find("# msg_stdout = !ansible -m debug -a 'msg={{{{ cgidp_metadata"), find('# !ls -l {cgidp_metadata}'),
                     find('src={cgidp_metadata}')}
     for index, text in inventory_cells(original, controls, args.group):
         inputs = deployment_inputs(index, text, controls, cells)
+        if index == schema:
+            url = os.environ['LC4RI_PLATFORM_SCHEMA_URL']
+            if not re.fullmatch(r'https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/jupyterhub/resources-schema\.json', url):
+                raise ValueError(f'Expected a platform schema URL pinned to its build commit: {url!r}')
+            controls.edit(index, text.replace(default_schema, url) + """
+import hashlib
+from pathlib import Path
+schema_sha256 = hashlib.sha256((Path(work_dir) / 'resources-schema.json').read_bytes()).hexdigest()
+print(schema_sha256)
+assert schema_sha256 == """ + repr(os.environ['LC4RI_PLATFORM_SCHEMA_SHA256']),
+                          'Fetch the schema at the platform build commit and compare it with the Hub image')
         if index == subnet:
             controls.edit(index, text.removeprefix('###### '), 'Select the example overlay subnet for the CI cluster dry run')
         if index == moodle:
@@ -251,6 +283,19 @@ def operate_o01(original, args, controls, page, records, results):
             continue
         inputs = deployment_inputs(index, text, controls, cells)
         check_output('O01', index, text, controls.run(index, inputs=inputs))
+
+
+def verify_platform_images(master, results):
+    if 'LC4RI_PLATFORM_HUB' not in os.environ:
+        return
+    images = {}
+    for service, expected in [('jupyterhub', os.environ['LC4RI_HUB_DIGEST']),
+                              ('auth-proxy', os.environ['LC4RI_AUTH_DIGEST'])]:
+        actual = remote(master, "docker service inspect --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' coursewarehub_" + service)
+        images[service] = actual
+        assert '@' in actual and actual.split('@')[1] == expected.split('@')[1], (service, expected, actual)
+    results.mkdir(parents=True, exist_ok=True)
+    (results / 'platform-services.json').write_text(json.dumps(images, indent=2))
 
 
 def verify_inventory(args, results, api):
