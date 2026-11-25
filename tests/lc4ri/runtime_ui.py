@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from playwright.sync_api import expect
 
-from construction import remote
+from construction import check_git_log, remote
 from browser_evidence import BrowserRecording
 
 
@@ -158,12 +158,34 @@ class AdminNotebookSession:
         from notebook_controls import operations
         d06_records=[]
         controls=operations(self.page,'D06',canonical,d06_records,timeout=300000)
+        repository_cell = clone_cell = history_cell = None
+        if self.args.manage_tools:
+            url, sha = self.args.manage_tools
+            setting = "REPOS_URL='https://github.com/NII-cloud-operation/CoursewareHub-LC_manage-tools.git'"
+            clone = '!git clone {REPOS_URL} {work_dir}/{repo_name}'
+            repository_cell = controls.find(setting)
+            clone_cell = controls.find(clone)
+            history_cell = controls.find('!cd {work_dir}/{repo_name} && git log -n 5')
         for index,cell in enumerate(original):
             if cell['type']!='code' or not cell['text'].strip():continue
+            if index == repository_cell:
+                updated = cell['text'].replace(setting, 'REPOS_URL=' + repr(url))
+                if updated != cell['text']:
+                    controls.edit(index, updated, 'Select the course management tools repository')
+            if index == clone_cell:
+                if cell['text'].splitlines().count(clone) != 1:
+                    raise ValueError(f'Expected one complete clone command: {clone}')
+                directory = '{work_dir}/{repo_name}'
+                commands = (f'{clone} && git -C {directory} fetch origin {sha} '
+                            f'&& git -C {directory} checkout --detach {sha}')
+                controls.edit(index, cell['text'].replace(clone, commands), 'Select the course tools revision')
             observed=controls.run(index)
+            if index == history_cell:
+                check_git_log(observed, sha)
             if '-CD' not in cell['text']:
                 assert not any('FAILED!' in str(o) or 'UNREACHABLE!' in str(o) for o in observed['outputs']),observed['outputs']
-        assert self.page.evaluate('()=>Jupyter.notebook.get_cells().slice(0,'+str(len(original))+').map(c=>({type:c.cell_type,text:c.get_text()}))')==original
+        expected = [dict(cell, text=controls.edits.get(i, cell['text'])) for i, cell in enumerate(original)]
+        assert self.page.evaluate('()=>Jupyter.notebook.get_cells().slice(0,'+str(len(original))+').map(c=>({type:c.cell_type,text:c.get_text()}))')==expected
         (self.results/'D06-operations.json').write_text(json.dumps(d06_records,indent=2)+'\n')
         self.page.keyboard.press('Control+s')
         self.page.wait_for_function('!Jupyter.notebook.dirty')

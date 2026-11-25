@@ -1,4 +1,5 @@
 """Human operations and independent acceptance checks for construction notebooks."""
+import ast
 import json
 import os
 import re
@@ -72,7 +73,12 @@ def operate_d02(original, args, controls, page, records, results):
         elif index == setting:
             edit(index, text.replace("'10.1.1.162'", repr(args.master)), 'Select the NFS and master hosts')
         elif index == image and args.hub_image is not None:
-            edit(index, re.sub(r"^group_vars\['jupyterhub_image'\] = .+$", "group_vars['jupyterhub_image'] = " + repr(args.hub_image), text, flags=re.M), 'Select the Hub image with the fixture CA')
+            updated = re.sub(r"^group_vars\['jupyterhub_image'\] = .+$", "group_vars['jupyterhub_image'] = " + repr(args.hub_image), text, flags=re.M)
+            if 'LC4RI_AUTH_IMAGE' in os.environ:
+                if find("group_vars['auth_proxy_image'] = ") != index:
+                    raise ValueError('D02: expected both platform image settings in the same input cell')
+                updated = re.sub(r"^group_vars\['auth_proxy_image'\] = .+$", "group_vars['auth_proxy_image'] = " + repr(os.environ['LC4RI_AUTH_IMAGE']), updated, flags=re.M)
+            edit(index, updated, 'Select the images for this deployment')
         elif index == hostname:
             edit(index, text.replace("'example.com'", "'coursewarehub.test'"), 'Set the service hostname')
         elif index in federation:
@@ -83,10 +89,39 @@ def operate_d02(original, args, controls, page, records, results):
             assert str(observed['outputs']).count('SUCCESS') == 1 + len(args.workers), observed['outputs']
 
 
+ROLE_CLONE = ('!git clone https://github.com/NII-cloud-operation/CoursewareHub-LC_jupyterhub-deploy.git '
+              '{work_dir}/jupyterhub-deploy')
+
+
+def edit_role_clone(controls, index, text, revision):
+    if text.splitlines().count(ROLE_CLONE) != 1:
+        raise ValueError(f'Expected one complete clone command: {ROLE_CLONE}')
+    url, sha = revision
+    directory = '{work_dir}/jupyterhub-deploy'
+    commands = (f'!git clone {url} {directory} && git -C {directory} fetch origin {sha} '
+                f'&& git -C {directory} checkout --detach {sha}')
+    controls.edit(index, text.replace(ROLE_CLONE, commands), 'Select the roles revision')
+
+
+def check_git_log(observed, expected):
+    output = ''.join(''.join(o['text']) for o in observed['outputs'] if o['output_type'] == 'stream')
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', output)
+    first = re.search(r'^commit ([0-9a-f]{40})\b', plain, re.M)
+    assert first and first[1] == expected, (expected, output)
+
+
+
 def operate_d03(original, args, controls, page, records, results):
+    role_clone = controls.find(ROLE_CLONE) if args.jupyterhub_deploy else None
+    role_history = controls.find('!cd {work_dir}/jupyterhub-deploy/ && git log -n 5') if args.jupyterhub_deploy else None
     before = {host: remote(host, 'cat /proc/sys/kernel/random/boot_id') for host in (args.master, *args.workers)}
     for index, text in inventory_cells(original, controls, args.group):
-        check_output('D03', index, text, controls.run(index))
+        if index == role_clone:
+            edit_role_clone(controls, index, text, args.jupyterhub_deploy)
+        observed = controls.run(index)
+        if index == role_history:
+            check_git_log(observed, args.jupyterhub_deploy[1])
+        check_output('D03', index, text, observed)
     after = {host: remote(host, 'cat /proc/sys/kernel/random/boot_id') for host in before}
     assert before[args.worker] != after[args.worker], 'D03 did not reboot the worker OS'
     mounts = remote(args.worker, 'findmnt --json --target /exchange')
@@ -119,8 +154,12 @@ def operate_d04(original, args, controls, page, records, results):
     (results / 'deployment-dns.txt').write_text(dns)
 
 
+HUB_CONFIG_VOLUME = '    - read_only: true\n      source: /etc/jupyterhub/jupyterhub_config.d\n'
+
+
 def deployment_cells(controls):
     return dict(certificate=controls.find('use_saml_cert_as_server_cert = False'),
+                compose=controls.find(HUB_CONFIG_VOLUME),
                 removal=controls.find('docker stack rm coursewarehub'),
                 password=controls.find('db_pass = getpass()'),
                 acme=controls.find("acme_server = input('ACME Server URL')\n"
@@ -131,6 +170,16 @@ def deployment_cells(controls):
 
 
 def deployment_inputs(index, text, controls, cells):
+    if index == cells['compose']:
+        if text.count(HUB_CONFIG_VOLUME) != 1:
+            raise ValueError('Expected one JupyterHub config mount in the Compose template')
+        ca_volume = '''    - read_only: true
+      source: /home/centos/certs/hub-ca-bundle.pem
+      target: /etc/ssl/certs/ca-certificates.crt
+      type: bind
+'''
+        controls.edit(index, text.replace(HUB_CONFIG_VOLUME, ca_volume + HUB_CONFIG_VOLUME),
+                      'Mount the test CA bundle for JupyterHub registry access')
     if index == cells['certificate']:
         controls.edit(index, text.replace('use_saml_cert_as_server_cert = False', 'use_saml_cert_as_server_cert = True'), 'Use the locally provisioned test certificate')
     if index == cells['removal']:
@@ -176,6 +225,8 @@ def inspect_simplesaml_log(notebook, index, controls, master, records):
 
 
 def operate_d05(original, args, controls, page, records, results):
+    role_clone = controls.find(ROLE_CLONE) if args.jupyterhub_deploy else None
+    role_history = controls.find('!cd {work_dir}/jupyterhub-deploy && git log -n 5') if args.jupyterhub_deploy else None
     find = controls.find
     cells = deployment_cells(controls)
     subnet = find('###### ipam_config = ')
@@ -187,12 +238,23 @@ def operate_d05(original, args, controls, page, records, results):
     log_check = find('cat /var/www/simplesamlphp/log/simplesamlphp.log')
     registration = find('teacher_info_stdout =')
     moodle = find('lti_config = {}') if args.test_moodle else None
+    default_schema = 'https://raw.githubusercontent.com/NII-cloud-operation/CoursewareHub-LC_platform/master/jupyterhub/resources-schema.json'
+    schema = find(default_schema) if 'LC4RI_PLATFORM_HUB' in os.environ else None
+    if schema is not None:
+        work_directory = find('work_dir = tempfile.mkdtemp()\nwork_dir')
     metadata = set()
     if args.saml is not None:
         metadata = {find("# msg_stdout = !ansible -m debug -a 'msg={{{{ cgidp_metadata"), find('# !ls -l {cgidp_metadata}'),
                     find('src={cgidp_metadata}')}
     for index, text in inventory_cells(original, controls, args.group):
+        if index == role_clone:
+            edit_role_clone(controls, index, text, args.jupyterhub_deploy)
         inputs = deployment_inputs(index, text, controls, cells)
+        if index == schema:
+            url = os.environ['LC4RI_PLATFORM_SCHEMA_URL']
+            if not re.fullmatch(r'https://raw\.githubusercontent\.com/[\w.-]+/[\w.-]+/[0-9a-f]{40}/jupyterhub/resources-schema\.json', url):
+                raise ValueError(f'Expected a platform schema URL pinned to its build commit: {url!r}')
+            controls.edit(index, text.replace(default_schema, url), 'Use the resource schema from the platform build')
         if index == subnet:
             controls.edit(index, text.removeprefix('###### '), 'Select the example overlay subnet for the CI cluster dry run')
         if index == moodle:
@@ -231,6 +293,15 @@ else:
             inspect_simplesaml_log('D05', index, controls, args.master, records)
             continue
         observed = controls.run(index, inputs=inputs)
+        if index == role_history:
+            check_git_log(observed, args.jupyterhub_deploy[1])
+        if index == schema:
+            directory_output, = (o for o in controls.state(work_directory)['outputs'] if o['output_type'] == 'execute_result')
+            directory = ast.literal_eval(''.join(directory_output['data']['text/plain']))
+            checksum = subprocess.check_output(['docker', 'exec', 'cwh-lc4ri-controller', 'sha256sum',
+                                                os.path.join(directory, 'resources-schema.json')], text=True, timeout=30)
+            assert checksum.split()[0] == os.environ['LC4RI_PLATFORM_SCHEMA_SHA256'], checksum
+            (results / 'resources-schema.sha256').write_text(checksum)
         if index == registration and args.admin_password is None:
             combined = '\n'.join(o.get('text', '') for o in observed['outputs'])
             combined = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', combined)
@@ -251,6 +322,19 @@ def operate_o01(original, args, controls, page, records, results):
             continue
         inputs = deployment_inputs(index, text, controls, cells)
         check_output('O01', index, text, controls.run(index, inputs=inputs))
+
+
+def verify_platform_images(master, results):
+    if 'LC4RI_PLATFORM_HUB' not in os.environ:
+        return
+    images = {}
+    for service, expected in [('jupyterhub', os.environ['LC4RI_HUB_DIGEST']),
+                              ('auth-proxy', os.environ['LC4RI_AUTH_DIGEST'])]:
+        actual = remote(master, "docker service inspect --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' coursewarehub_" + service)
+        images[service] = actual
+        assert '@' in actual and actual.split('@')[1] == expected.split('@')[1], (service, expected, actual)
+    results.mkdir(parents=True, exist_ok=True)
+    (results / 'platform-services.json').write_text(json.dumps(images, indent=2))
 
 
 def verify_inventory(args, results, api):

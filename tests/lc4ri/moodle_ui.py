@@ -22,6 +22,8 @@ def check_moodle(results, moodle, manager, identities, browser, *, expected_exis
         context.tracing.start(screenshots=True, snapshots=True, sources=True)
         page = context.new_page()
         page.set_default_timeout(60000)
+        skip_tour = page.get_by_role('button', name='Skip tour', exact=True)
+        page.add_locator_handler(skip_tour, lambda: skip_tour.click())
         requests = []
         page.on('request', lambda request: requests.append(dict(
             method=request.method, origin=urlparse(request.url).netloc,
